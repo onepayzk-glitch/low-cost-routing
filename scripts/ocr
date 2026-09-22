@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# ocr — 用本机 tesseract 从图片里取字（中文已装好，放在用户目录，不需要 sudo）。
+#
+# 为什么要这个包装：chi_sim 装在 ~/.local/share/tessdata，不设 TESSDATA_PREFIX 就会
+# 退回系统目录、只认 eng，中文直接出乱码（实测 "搜索任务" → "Q #FRES"）。
+# 把环境变量封在这里，调用方就不用记。
+#
+# 用法：
+#   ocr 图片.png                 # 默认 chi_sim+eng
+#   ocr 图片.png eng             # 只要英文
+#   wl-paste -t image/png | ocr -   # 直接从剪贴板
+#
+# 定位：这是「截图取字」的首选。它输出的文本比把图喂给主模型（视觉 token）小 1–2 个
+#       数量级，而且是 $0。只有版面复杂、OCR 明显不对时才回退到 read_image 看图。
+set -euo pipefail
+
+export TESSDATA_PREFIX="${TESSDATA_PREFIX:-$HOME/.local/share/tessdata}"
+lang="${2:-chi_sim+eng}"
+img="${1:--}"
+
+if [ ! -d "$TESSDATA_PREFIX" ]; then
+  echo "ocr: 找不到 $TESSDATA_PREFIX —— 先装 chi_sim.traineddata" >&2
+  exit 1
+fi
+
+if [ "$img" = "-" ]; then
+  tmp="$(mktemp --suffix=.png)"
+  trap 'rm -f "$tmp"' EXIT
+  cat > "$tmp"
+  img="$tmp"
+fi
+
+if [ ! -f "$img" ]; then
+  echo "ocr: 没有这个文件：$img" >&2
+  exit 1
+fi
+
+# 丢掉 tesseract 的进度噪音，只出正文
+exec tesseract "$img" stdout -l "$lang" 2>/dev/null

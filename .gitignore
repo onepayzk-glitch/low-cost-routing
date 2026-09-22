@@ -1,0 +1,18 @@
+# 绝不提交的东西
+secrets/
+*.env
+*_api_key
+ark_endpoint
+*.key
+
+# 索引/缓存
+*.db
+*.db-wal
+*.db-shm
+.wq/
+
+# 编辑器/系统
+.DS_Store
+*.swp
+__pycache__/
+*.pyc

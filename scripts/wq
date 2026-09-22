@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""wq —— 工作区全文检索，用本地 FTS5(trigram) 索引，不把文件读进主模型上下文。
+
+为什么存在：账本显示会话成本的 67% 是"每一步重发上下文"。把"在代码/文档里找东西"
+从"read 一堆文件"换成"一条 SQL"，攻击的就是这一块。
+
+用法：
+  wq 关键词 [关键词...]        检索（多词 AND，默认最多 50 条）
+  wq -n 20 关键词              限制条数
+  wq --reindex [路径...]       重建索引（默认当前目录；也可用 $WQ_ROOTS，冒号分隔）
+  wq --stats                   索引统计
+  wq --files                   列出索引覆盖的文件
+
+中文要点（本机实测）：
+  FTS5 默认 unicode61 分词器**不切中文**，任何中文查询都 0 命中；
+  必须用 tokenize='trigram'。而 trigram 要求查询词 **≥3 个字符**——
+  1–2 字的词走 LIKE 回退（本脚本已自动处理）。
+
+不索引：.git / node_modules / .venv / __pycache__ / dist / build / .cache，
+以及 >512KB 的文件和二进制文件。索引库本身也在 ~/.local/share/wq/ 下，不会被自索引。
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+DB_DIR = Path.home() / ".local" / "share" / "wq"
+DB = DB_DIR / "index.db"
+DEFAULT_ROOTS = [Path.cwd()]   # 默认索引当前目录；可用 WQ_ROOTS 或 `wq --reindex <路径…>` 覆盖
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+             ".cache", ".mypy_cache", ".ruff_cache", ".pytest_cache", "target",
+             ".next", "site-packages", ".local/share/wq",
+             # 实测：某次索引里，一个内置了整套 Node.js 源码的目录占掉了整库
+             # 1.24M 行中的 1.10M 行（88.5%），全是检索噪音。留着这几条通用排除项。
+             "node-runtime", "third_party", "vendor"}
+SKIP_NAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "Cargo.lock"}
+SKIP_SUFFIXES = (".min.js", ".min.css", ".map", ".lock")
+MAX_BYTES = 512 * 1024
+
+
+def connect() -> sqlite3.Connection:
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB)
+    con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS docs "
+                "USING fts5(path, lineno UNINDEXED, text, tokenize='trigram')")
+    return con
+
+
+def iter_files(roots):
+    for root in roots:
+        root = root.expanduser()
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for fn in filenames:
+                if fn in SKIP_NAMES or fn.endswith(SKIP_SUFFIXES):
+                    continue
+                p = Path(dirpath) / fn
+                try:
+                    if p.is_symlink() or p.stat().st_size > MAX_BYTES:
+                        continue
+                except OSError:
+                    continue
+                yield p
+
+
+def reindex(roots):
+    con = connect()
+    con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    con.execute("DELETE FROM docs")
+    n_files = n_lines = skipped = 0
+    for p in iter_files(roots):
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            skipped += 1
+            continue
+        if b"\x00" in raw[:4096]:          # 二进制
+            skipped += 1
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", "replace")
+        rows = [(str(p), i, ln) for i, ln in enumerate(text.splitlines(), 1) if ln.strip()]
+        if rows:
+            con.executemany("INSERT INTO docs(path, lineno, text) VALUES (?,?,?)", rows)
+            n_files += 1
+            n_lines += len(rows)
+    # 记下这次索引了哪些根目录，`wq --stats` 会显示——免得回头不知道索引的是哪儿。
+    con.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('roots', ?)",
+                ("\n".join(str(r) for r in roots),))
+    con.commit()
+    con.execute("INSERT INTO docs(docs) VALUES('optimize')")   # 合并 trigram 段
+    con.commit()
+    # FTS5 的 DELETE 不回收空间：不清一次，索引会越重建越大（实测 64MB → 123MB）。
+    before = DB.stat().st_size / 1048576
+    con.execute("VACUUM")
+    after = DB.stat().st_size / 1048576
+    con.close()
+    print(f"已索引 {n_files} 个文件 / {n_lines} 行（跳过 {skipped}）；"
+          f"索引 {before:.1f} → {after:.1f} MB → {DB}")
+
+
+def stats():
+    con = connect()
+    rows = con.execute("SELECT count(*), count(DISTINCT path) FROM docs").fetchone()
+    size = DB.stat().st_size / 1048576 if DB.exists() else 0
+    print(f"索引：{rows[1]} 个文件 / {rows[0]} 行 · {size:.1f} MB · {DB}")
+    try:
+        r = con.execute("SELECT v FROM meta WHERE k='roots'").fetchone()
+        if r and r[0]:
+            print("索引范围：")
+            for line in r[0].splitlines():
+                print(f"  {line}")
+    except sqlite3.Error:
+        pass
+
+
+def files():
+    con = connect()
+    for (p,) in con.execute("SELECT DISTINCT path FROM docs ORDER BY path"):
+        print(p)
+
+
+def search(terms, limit):
+    con = connect()
+    where, params = [], []
+    # FTS5 每张表只允许**一个** MATCH 约束，所以多个长词必须合成一个 MATCH 表达式
+    # （用 AND 连接）。给每个词各生成一个 MATCH 会静默返回 0 命中——实测踩过。
+    long_terms = [t for t in terms if len(t) >= 3]
+    short_terms = [t for t in terms if len(t) < 3]
+    if long_terms:
+        expr = " AND ".join('"' + t.replace('"', '""') + '"' for t in long_terms)
+        where.append("docs MATCH ?")
+        params.append(expr)
+    for t in short_terms:                      # 中文双字词等短词回退 LIKE
+        where.append("text LIKE ?")
+        params.append(f"%{t}%")
+    sql = (f"SELECT path, lineno, text FROM docs WHERE {' AND '.join(where)} "
+           f"ORDER BY path, lineno LIMIT ?")
+    params.append(limit)
+    try:
+        rows = con.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"wq: 查询失败：{e}", file=sys.stderr)
+        return 1
+    if not rows:
+        print(f"（无命中：{' '.join(terms)}）—— 索引可能是空的，先跑 wq --reindex")
+        return 1
+    home = str(Path.home())
+    for path, lineno, text in rows:
+        shown = path.replace(home, "~")
+        snippet = text.strip()[:200]
+        print(f"{shown}:{lineno}: {snippet}")
+    print(f"\n—— {len(rows)} 条命中（上限 {limit}）", file=sys.stderr)
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv else 2
+    if argv[0] == "--reindex":
+        # 优先显式路径，其次 $WQ_ROOTS（冒号分隔），最后当前目录
+        roots = [Path(a) for a in argv[1:]]
+        if not roots:
+            env = os.environ.get("WQ_ROOTS", "").strip()
+            roots = [Path(p) for p in env.split(":") if p.strip()] if env else DEFAULT_ROOTS
+        reindex(roots)
+        return 0
+    if argv[0] == "--stats":
+        stats()
+        return 0
+    if argv[0] == "--files":
+        files()
+        return 0
+    limit = 50
+    if argv[0] in ("-n", "--limit") and len(argv) > 1:
+        limit = int(argv[1])
+        argv = argv[2:]
+    if not argv:
+        print("wq: 缺关键词", file=sys.stderr)
+        return 2
+    return search(argv, limit)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

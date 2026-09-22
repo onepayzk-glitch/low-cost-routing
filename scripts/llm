@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""llm —— 免费 / 免费额度模型的统一入口（OpenAI 兼容协议，一个客户端打通四家）。
+
+为什么存在：本地 qwen2.5:1.5b 只能干轻活，Jev 只做判断。中间那层"要一点真实能力但不想花钱"
+的活（草稿、改写、翻译、摘要、简单问答、小段代码）交给这几个免费档更划算。
+
+四家（2026-09-22 实测全部可用）：
+  zhipu        智谱 GLM-4-Flash        免费
+  openrouter   :free 档（每天 50 次）   注意免费额度是按**请求数**计的，不是 token
+  siliconflow  硅基流动                 有免费额度，模型多
+  ark          火山方舟（豆包）         走接入点 ID；**推理模型，注意 token 消耗**
+
+密钥：读 ~/.dsh/secrets/<provider>_api_key（mode 600），**不回显、不落日志、不进 git**。
+
+用法：
+  llm ark "把这句话改得更正式：这玩意儿不太好使"
+  llm zhipu --system "只输出 JSON" "抽取：张三，13800138000"
+  llm list                      列出 provider 与默认模型
+  llm --health                  实测四家连通性（不消耗多少额度）
+  echo "长文本" | llm siliconflow --stdin
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+def _xdg_secrets() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "low-cost-routing", "secrets")
+
+
+# 密钥目录搜索顺序：显式覆盖 > 本工具自己的 XDG 目录 > 两个 agent 各自的目录。
+# 这样同一份脚本在裸机、DSH、WorkBuddy 上都能跑通。
+SECRET_DIRS = [d for d in (
+    os.environ.get("LCR_SECRETS_DIR"),
+    os.environ.get("DSH_SECRETS_DIR"),      # 旧名，保留兼容
+    _xdg_secrets(),
+    os.path.expanduser("~/.dsh/secrets"),
+    os.path.expanduser("~/.workbuddy/secrets"),
+) if d]
+SECRETS = SECRET_DIRS[0]   # 仅用于错误提示里展示首选路径
+
+PROVIDERS = {
+    "zhipu": {
+        "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "key": "zhipu_api_key",
+        "model": "glm-4-flash",
+        "note": "免费；快，适合草稿/改写",
+    },
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "key": "openrouter_api_key",
+        "model": "nex-agi/nex-n2.5-mini:free",
+        "note": "免费额度按请求数计（实测 50 次/天）",
+    },
+    "siliconflow": {
+        "url": "https://api.siliconflow.cn/v1/chat/completions",
+        "key": "siliconflow_api_key",
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "note": "模型多，含 embedding / rerank",
+    },
+    "ark": {
+        "url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        "key": "ark_api_key",
+        # 为了不把接入点 ID 写死在公开脚本里，默认从文件读；也可 --model 覆盖
+        "model_file": "ark_endpoint",
+        "model": None,
+        "note": "豆包。接入点 ID 放 ~/.dsh/secrets/ark_endpoint",
+    },
+}
+
+
+def read_secret(name: str) -> str | None:
+    for d in SECRET_DIRS:
+        p = os.path.join(d, name)
+        try:
+            with open(p, encoding="utf-8") as f:
+                v = f.read().strip()
+        except OSError:
+            continue
+        if v:
+            return v
+    return None
+
+
+def _read_one(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = f.read().strip()
+        return v or None
+    except OSError:
+        return None
+
+
+def resolve_model(prov: str, override: str | None) -> str:
+    if override:
+        return override
+    cfg = PROVIDERS[prov]
+    if cfg.get("model_file"):
+        m = read_secret(cfg["model_file"])
+        if m:
+            return m
+    if cfg.get("model"):
+        return cfg["model"]
+    raise SystemExit(f"llm: {prov} 没有默认模型——用 --model 指定，或写 {SECRETS}/{cfg.get('model_file')}")
+
+
+def call(prov: str, model: str, messages: list[dict], max_tokens: int,
+         timeout: int = 120, think: bool = False) -> dict:
+    cfg = PROVIDERS[prov]
+    key = read_secret(cfg["key"])
+    if not key:
+        raise SystemExit(f"llm: 缺少 ~/.dsh/secrets/{cfg['key']}")
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    # 火山方舟的 doubao-seed 系列默认开思考，一句 20 字回答能烧 430–2390 token。
+    # 实测关掉后 430 → 66 token、reasoning_content 长度 0、15.7s → 1.5s。
+    # 所以 ark 默认关闭思考；要看推理过程再加 --think。
+    if prov == "ark" and not think:
+        body["thinking"] = {"type": "disabled"}
+    req = urllib.request.Request(
+        cfg["url"], data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "dsh-llm/1.0"}, method="POST")
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode())
+    data["_elapsed"] = round(time.time() - t0, 2)
+    return data
+
+
+def extract(data: dict) -> tuple[str, dict]:
+    ch = (data.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    content = msg.get("content") or ""
+    usage = data.get("usage") or {}
+    usage["_elapsed"] = data.get("_elapsed")
+    if not content and msg.get("reasoning_content"):
+        usage["_only_reasoning"] = True
+    return content, usage
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv else 2
+
+    if argv[0] == "list":
+        for name, cfg in PROVIDERS.items():
+            m = cfg.get("model") or f"(读 {cfg.get('model_file')})"
+            has = "✅" if read_secret(cfg["key"]) else "❌ 无 key"
+            print(f"  {name:12s} {has}  {m:34s} {cfg['note']}")
+        return 0
+
+    if argv[0] == "--health":
+        for name in PROVIDERS:
+            try:
+                model = resolve_model(name, None)
+            except SystemExit as e:
+                print(f"  {name:12s} ⚠️  {e}"); continue
+            try:
+                d = call(name, model, [{"role": "user", "content": "hi"}], 8, timeout=40)
+                c, u = extract(d)
+                print(f"  {name:12s} ✅ {u.get('_elapsed')}s  model={d.get('model')}  "
+                      f"tok={u.get('total_tokens')}")
+            except urllib.error.HTTPError as e:
+                print(f"  {name:12s} ❌ HTTP {e.code}: {e.read().decode('utf-8','replace')[:120]}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  {name:12s} ❌ {type(e).__name__}: {str(e)[:120]}")
+        return 0
+
+    if argv[0] == "--quota":
+        # 只有 OpenRouter 有公开的免费额度计数。其余三家没有可查接口：
+        # 硅基流动 /v1/user/info 已废弃（实测 410），余额路径 404。
+        key = read_secret(PROVIDERS["openrouter"]["key"])
+        if key:
+            try:
+                req = urllib.request.Request("https://openrouter.ai/api/v1/key",
+                                             headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    d = json.loads(r.read().decode()).get("data", {}) or {}
+                f = d.get("free_model_daily_requests") or {}
+                print(f"  openrouter  :free 请求 {f.get('used')}/{f.get('limit')} 已用，"
+                      f"剩 {f.get('remaining')}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  openrouter  查询失败：{e}")
+        else:
+            print("  openrouter  无 key")
+        print("  zhipu       glm-4-flash 是免费模型（无计数器可查）")
+        print("  siliconflow ⚠️ 额度查不到（/v1/user/info 已废弃 410）——用完会静默转计费")
+        print("  ark         默认已关闭思考（--think 可开回）；额度查不到")
+        return 0
+
+    prov = argv[0]
+    if prov not in PROVIDERS:
+        raise SystemExit(f"llm: 未知 provider {prov}（可选：{' '.join(PROVIDERS)}）")
+    rest = argv[1:]
+
+    model = system = None
+    max_tokens = 600
+    use_stdin = False
+    think = False
+    prompt_parts = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--model":
+            i += 1; model = rest[i]
+        elif a == "--system":
+            i += 1; system = rest[i]
+        elif a == "--think":
+            think = True
+        elif a == "--max-tokens":
+            i += 1; max_tokens = int(rest[i])
+        elif a == "--stdin":
+            use_stdin = True
+        else:
+            prompt_parts.append(a)
+        i += 1
+
+    prompt = " ".join(prompt_parts).strip()
+    if use_stdin or (not prompt and not sys.stdin.isatty()):
+        prompt = (prompt + "\n" + sys.stdin.read()).strip()
+    if not prompt:
+        raise SystemExit("llm: 没有输入")
+
+    model = resolve_model(prov, model)
+    messages = ([{"role": "system", "content": system}] if system else []) \
+        + [{"role": "user", "content": prompt}]
+    try:
+        data = call(prov, model, messages, max_tokens, think=think)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        sys.stderr.write(f"llm: HTTP {e.code}: {detail}\n")
+        if e.code == 429:
+            sys.stderr.write("llm: 429 = 免费额度用尽（OpenRouter 免费档是按**请求数**计的）。\n")
+        return 1
+
+    content, usage = extract(data)
+    print(content)
+    if usage.get("_only_reasoning"):
+        sys.stderr.write("llm: ⚠️ 该模型只返回了 reasoning_content，没有正文——"
+                         "加大 --max-tokens 或换模型。\n")
+    sys.stderr.write(f"[{prov} {data.get('model')} {usage.get('_elapsed')}s "
+                     f"tok={usage.get('total_tokens')}]\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

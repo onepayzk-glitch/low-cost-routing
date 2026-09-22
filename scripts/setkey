@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# setkey —— 把某个 provider 的 API key 写进密钥目录（不回显、不进 bash_history）。
+#
+# 为什么需要它：手动 `printf '%s' 'key' > 文件` 会让 key 出现在命令行里，
+# 从而落进 bash_history（实测踩过），而直接在对话里贴 key 又会落进会话记录。
+# 这个脚本用 `read -rs` 读输入：不回显、不出现在命令行、不进 history。
+#
+# 用法：
+#   setkey openrouter      # 逐个跑这四条即可
+#   setkey siliconflow
+#   setkey zhipu
+#   setkey ark
+#   setkey ark_endpoint    # 仅当接入点 ID 变了才需要
+#
+# 写到哪：$LCR_SECRETS_DIR（或旧的 $DSH_SECRETS_DIR）> 已存在的 ~/.dsh/secrets
+#         > 已存在的 ~/.workbuddy/secrets > ${XDG_CONFIG_HOME:-~/.config}/low-cost-routing/secrets
+# 文件名与 `llm` 客户端的约定一一对应，改完立刻生效——不用改代码、不用重启。
+set -euo pipefail
+
+if [ -n "${LCR_SECRETS_DIR:-}" ]; then
+  D="$LCR_SECRETS_DIR"
+elif [ -n "${DSH_SECRETS_DIR:-}" ]; then
+  D="$DSH_SECRETS_DIR"
+elif [ -d "$HOME/.dsh/secrets" ]; then
+  D="$HOME/.dsh/secrets"
+elif [ -d "$HOME/.workbuddy/secrets" ]; then
+  D="$HOME/.workbuddy/secrets"
+else
+  D="${XDG_CONFIG_HOME:-$HOME/.config}/low-cost-routing/secrets"
+fi
+
+case "${1:-}" in
+  zhipu|openrouter|siliconflow|ark) f="$D/${1}_api_key" ;;
+  ark_endpoint)                     f="$D/ark_endpoint" ;;
+  ""|-h|--help)
+    echo "用法: setkey <zhipu|openrouter|siliconflow|ark|ark_endpoint>"
+    echo "写入位置: $D/<名字>"
+    exit 2 ;;
+  *) echo "setkey: 未知 provider '$1'（可选: zhipu openrouter siliconflow ark ark_endpoint）" >&2; exit 2 ;;
+esac
+
+mkdir -p "$D"
+chmod 700 "$D" 2>/dev/null || true
+
+read -rsp "粘贴 ${1} 的 key（不回显，直接回车=取消）: " K
+echo
+if [ -z "${K:-}" ]; then
+  echo "空输入，未改动。"
+  exit 1
+fi
+
+printf '%s' "$K" > "$f"
+chmod 600 "$f"
+unset K
+echo "✅ 已写入 $f  （$(stat -c %s "$f") 字节，权限 $(stat -c %a "$f")）"
+echo "   验证： llm --health"
